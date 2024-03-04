@@ -14,28 +14,26 @@ const int NUM_BACKEND_SERVERS = 3;
 
 class LoadBalancer;
 
-
 class LoadBalancerMode {
 public:
-    virtual std::string selectBackend(LoadBalancer &lb) = 0;
+    virtual std::string selectBackend(LoadBalancer& lb) = 0;
     virtual ~LoadBalancerMode() {};
 };
-
 
 class LoadBalancer {
 private:
     std::vector<std::string> backendServers;
-    LoadBalancerMode *mode;
+    std::unique_ptr<LoadBalancerMode> mode;
     std::mutex mutex;
 
 public:
-    LoadBalancer(LoadBalancerMode *mode) : mode(mode) {}
+    LoadBalancer(std::unique_ptr<LoadBalancerMode> mode) : mode(std::move(mode)) {}
 
     void addBackendServer(const std::string &server) {
         backendServers.push_back(server);
     }
 
-    std::string selectBackend() {
+    std::string selectBackend(LoadBalancer& lb) {
         // Lock to ensure thread safety
         std::lock_guard<std::mutex> lock(mutex);
         return mode -> selectBackend(*this);
@@ -43,6 +41,10 @@ public:
 
     std::vector<std::string> getBackendServers() {
         return backendServers;
+    }
+
+    std::string getNextBackend() {
+        return selectBackend(*this);
     }
 };
 
@@ -55,7 +57,7 @@ private:
 public:
     RoundRobin() : currentIndex(-1) {}
 
-    std::string selectBackend(LoadBalancer &lb) {
+    std::string selectBackend(LoadBalancer& lb) override {
         std::vector<std::string> backendServers = lb.getBackendServers();
         size_t index = currentIndex++ % backendServers.size();
         return backendServers[index];
@@ -72,7 +74,7 @@ private:
     size_t currentIndex;
 
 public:
-    WeightedRoundRobin() : currentIndex(0) {}
+    WeightedRoundRobin() : currentIndex(-1) {}
 
     void add_server(const std::string& server, int weight) {
         servers.push_back(server);
@@ -80,7 +82,7 @@ public:
         originalWeights.push_back(weight);
     }
 
-    std::string selectBackend(LoadBalancer &lb) {
+    std::string selectBackend(LoadBalancer& lb) override {
         if (servers.empty()) {
             return "No server available"; // No servers added
         }
@@ -106,12 +108,12 @@ private:
 };
 
 
-// Thread function for simulating client requests
-void clientThread(LoadBalancer &lb, int threadId) {
-    std::string server = lb.selectBackend();
-    std::this_thread::sleep_for(std::chrono::seconds(1)); // Simulate processing time
-    std::cout << "Thread " << threadId << ": Selected backend server: " << server << std::endl;
+void handleConnection(int clientSocket, LoadBalancer& lb) {
+    std::string backendServer = lb.getNextBackend();
+    std::cout << "Routing request to backend server: " << backendServer << std::endl;
+    close(clientSocket);
 }
+
 
 int main(int argc, char *argv[]) {
     if (argc != 2) {
@@ -121,41 +123,79 @@ int main(int argc, char *argv[]) {
     }
 
     std::string modeStr = argv[1];
-    LoadBalancerMode *mode = nullptr;
+    std::unique_ptr<LoadBalancerMode> mode;
 
     if (modeStr == "RR") {
-        mode = new RoundRobin();
+        mode = std::make_unique<RoundRobin>();
     } else if (modeStr == "WRR") {
-        mode = new WeightedRoundRobin();
+        mode = std::make_unique<WeightedRoundRobin>();
         // Add weights for the backend servers
-        dynamic_cast<WeightedRoundRobin *>(mode) -> add_server("Server A", 3);
-        dynamic_cast<WeightedRoundRobin *>(mode) -> add_server("Server B", 1);
-        dynamic_cast<WeightedRoundRobin *>(mode) -> add_server("Server C", 2);
+        dynamic_cast<WeightedRoundRobin *>(mode.get()) -> add_server("127.0.0.1:8081", 3);
+        dynamic_cast<WeightedRoundRobin *>(mode.get()) -> add_server("127.0.0.1:8082", 1);
+        dynamic_cast<WeightedRoundRobin *>(mode.get()) -> add_server("127.0.0.1:8083", 2);
     } else {
         std:: cerr << "Invalid mode. Available modes: RR (Round Robin), WRR (Weighted Round Robin)" << std::endl;
         return 1;
     }
 
     // Create Load Balancer with specified mode
-    LoadBalancer lb(mode);
+    LoadBalancer lb(std::move(mode));
 
     // Add backend servers
-    lb.addBackendServer("Server A");
-    lb.addBackendServer("Server B");
-    lb.addBackendServer("Server C");
+    lb.addBackendServer("127.0.0.1:8081");
+    lb.addBackendServer("127.0.0.1:8082");
+    lb.addBackendServer("127.0.0.1:8083");
 
-    // Create client threads to simulate requests
-    std::vector<std::thread> threads;
-    for (int i = 0; i < 7; i++) {
-        threads.emplace_back(clientThread, std::ref(lb), i + 1);
+    // Create a socket for accepting incoming client connections
+    int serverSocket = socket(AF_INET, SOCK_STREAM, 0);
+    if (serverSocket == -1) {
+        std::cerr << "Error: Failed to create server socket" << std::endl;
+        return 1;
     }
 
-    // Wait for all threads to finish
-    for (auto &thread: threads) {
-        thread.join();
+    // Bind the server socket to a port
+    sockaddr_in serverAddr;
+    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_addr.s_addr = INADDR_ANY;
+    serverAddr.sin_port = htons(8080);
+    int opt = 1;
+
+    if (setsockopt(serverSocket, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt)) < 0) {
+        std::cerr << "Error setting socket options\n";
+        return 1;
     }
 
-    delete mode; // Free allocated memory
+    if (bind(serverSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) == -1) {
+        std::cerr << "Error: Failed to bind server socket" << std::endl;
+        close(serverSocket);
+        return 1;
+    }
+
+    // Listen for incoming client connections
+    if (listen(serverSocket, SOMAXCONN) == -1) {
+        std::cerr << "Error failed to listen for client connections" << std::endl;
+        close(serverSocket);
+        return 1;
+    }
+
+    std::cout << "Load balancer server running..." << std::endl;
+
+    // Accept incoming connections and handle them in separate thread
+    while (true) {
+        sockaddr_in clientAddr;
+        socklen_t clientAddrLen = sizeof(clientAddr);
+        int clientSocket = accept(serverSocket, reinterpret_cast<sockaddr*>(&clientAddr), &clientAddrLen);
+        if (clientSocket == -1) {
+            std::cerr << "Error: Failed to accept client connection" << std::endl;
+            continue;
+        }
+
+        // Handle the client connection in a separate thread
+        std::thread(handleConnection, clientSocket, std::ref(lb)).detach();
+    }
+
+    // Close the server socket
+    close(serverSocket);
 
     return 0;
 }
