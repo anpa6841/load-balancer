@@ -7,6 +7,10 @@
 #include <unistd.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <unordered_map>
+#include <functional>
+#include <random>
+#include <chrono>
 
 
 // Number of backend servers
@@ -16,7 +20,7 @@ class LoadBalancer;
 
 class LoadBalancerMode {
 public:
-    virtual std::string selectBackend(LoadBalancer& lb) = 0;
+    virtual std::string selectBackend(LoadBalancer& lb, const std::string& clientIP = "") = 0;
     virtual ~LoadBalancerMode() {};
 };
 
@@ -33,18 +37,18 @@ public:
         backendServers.push_back(server);
     }
 
-    std::string selectBackend(LoadBalancer& lb) {
+    std::string selectBackend(LoadBalancer& lb, const std::string& clientIP) {
         // Lock to ensure thread safety
         std::lock_guard<std::mutex> lock(mutex);
-        return mode -> selectBackend(*this);
+        return mode -> selectBackend(*this, clientIP);
     }
 
     std::vector<std::string> getBackendServers() {
         return backendServers;
     }
 
-    std::string getNextBackend() {
-        return selectBackend(*this);
+    std::string getNextBackend(const std::string& clientIP) {
+        return selectBackend(*this, clientIP);
     }
 };
 
@@ -55,11 +59,12 @@ private:
     size_t currentIndex;
 
 public:
-    RoundRobin() : currentIndex(-1) {}
+    RoundRobin() : currentIndex(0) {}
 
-    std::string selectBackend(LoadBalancer& lb) override {
+    std::string selectBackend(LoadBalancer& lb, const std::string& /* clientIP */) override {
         std::vector<std::string> backendServers = lb.getBackendServers();
         size_t index = currentIndex++ % backendServers.size();
+        // std::cout << "Current Index: " << currentIndex << " ";
         return backendServers[index];
     }
 };
@@ -82,7 +87,7 @@ public:
         originalWeights.push_back(weight);
     }
 
-    std::string selectBackend(LoadBalancer& lb) override {
+    std::string selectBackend(LoadBalancer& lb, const std::string& /* clientIP */) override {
         if (servers.empty()) {
             return "No server available"; // No servers added
         }
@@ -91,7 +96,8 @@ public:
         for (size_t i = 0; i < servers.size(); i++) {
             currentIndex = (currentIndex + 1) % servers.size();
             if (weights[currentIndex] > 0) {
-                --weights[currentIndex]; // Decrement weight
+                --weights[currentIndex]; // Decrement 
+                // std::cout << "Current Index: " << currentIndex << " ";
                 return servers[currentIndex]; // Return server name
             }
         }
@@ -108,8 +114,68 @@ private:
 };
 
 
-void handleConnection(int clientSocket, LoadBalancer& lb) {
-    std::string backendServer = lb.getNextBackend();
+class IPHashing : public LoadBalancerMode {
+private:
+    // Maps client IP to backend server index
+    std::unordered_map<std::string, size_t> clientToServerMap;
+
+public:
+    // Hash function for IPv4 addresses
+    size_t hashIPv4(const std::string& ipAddress) const {
+        std::hash<std::string> hashFunction;
+        return hashFunction(ipAddress);
+    }
+
+    std::string selectBackend(LoadBalancer& lb, const std::string& clientIP) override {
+        std::vector<std::string> backendServers = lb.getBackendServers();
+
+        std::cout << "Client IP: " << clientIP << std::endl;
+
+        // If client IP is already mapped, return the corresponding backend server
+        if (clientToServerMap.find(clientIP) != clientToServerMap.end()) {
+            size_t index = clientToServerMap[clientIP];
+            return backendServers[index];
+        }
+
+        // Calculate hash value from client IP
+        size_t hashValue = hashIPv4(clientIP);
+    
+        // Determine backend server index based on hash value
+        // Save the index in the clientToServerMap for subsequent
+        // requests lookup originating from the same client
+        size_t index = hashValue % backendServers.size();
+        clientToServerMap[clientIP] = index;
+
+        // Return backend server corresponding to the index
+        return backendServers[index];
+    }
+};
+
+
+class Random : public LoadBalancerMode {
+public:
+    std::string selectBackend(LoadBalancer& lb, const std::string& /* clientIP */) override {
+        std::vector<std::string> backendServers = lb.getBackendServers();
+        if (backendServers.empty()) {
+            return ""; // No server available
+        }
+
+        // Seed the random number generator with current time
+        auto seed = std::chrono::system_clock::now().time_since_epoch().count();
+        std::mt19937 gen(static_cast<unsigned int>(seed));
+
+        // Randomly select a backend server index
+        std::uniform_int_distribution<size_t> dist(0, backendServers.size() - 1);
+        size_t index = dist(gen);
+
+        // Return the random selected backend server
+        return backendServers[index];
+    }
+};
+
+
+void handleConnection(int clientSocket, LoadBalancer& lb, const std::string& clientIP) {
+    std::string backendServer = lb.getNextBackend(clientIP);
     std::cout << "Routing request to backend server: " << backendServer << std::endl;
     close(clientSocket);
 }
@@ -118,7 +184,7 @@ void handleConnection(int clientSocket, LoadBalancer& lb) {
 int main(int argc, char *argv[]) {
     if (argc != 2) {
         std::cerr << "Usage: " << argv[0] << " [mode]" << std::endl;
-        std::cout << "Available modes: RR (Round Robin), WRR (Weighted Round Robin)" << std::endl;
+        std::cout << "Available modes: RR (Round Robin), WRR (Weighted Round Robin), IPH (IP Hashing), Random (RA)" << std::endl;
         return 1;
     }
 
@@ -133,6 +199,10 @@ int main(int argc, char *argv[]) {
         dynamic_cast<WeightedRoundRobin *>(mode.get()) -> add_server("127.0.0.1:8081", 3);
         dynamic_cast<WeightedRoundRobin *>(mode.get()) -> add_server("127.0.0.1:8082", 1);
         dynamic_cast<WeightedRoundRobin *>(mode.get()) -> add_server("127.0.0.1:8083", 2);
+    } else if (modeStr == "IPH") {
+        mode = std::make_unique<IPHashing>();
+    } else if (modeStr == "RA") {
+        mode = std::make_unique<Random>();
     } else {
         std:: cerr << "Invalid mode. Available modes: RR (Round Robin), WRR (Weighted Round Robin)" << std::endl;
         return 1;
@@ -191,7 +261,7 @@ int main(int argc, char *argv[]) {
         }
 
         // Handle the client connection in a separate thread
-        std::thread(handleConnection, clientSocket, std::ref(lb)).detach();
+        std::thread(handleConnection, clientSocket, std::ref(lb), inet_ntoa(clientAddr.sin_addr)).detach();
     }
 
     // Close the server socket
