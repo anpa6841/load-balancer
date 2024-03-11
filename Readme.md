@@ -1,7 +1,7 @@
 #### Load Balancer setup
 
-- g++ --std=c++14 -o load_balancer load_balancer.cpp
-- ./load_balancer
+- make lb
+- ./lb
 
 
 #### Load Balancer modes supported
